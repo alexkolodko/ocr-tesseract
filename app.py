@@ -5,24 +5,13 @@ import numpy as np
 import cv2
 import io
 import json
+import pdf2image
+import tempfile
+import os
 
 # Set page config
 st.set_page_config(layout="wide")
 
-# Add custom CSS to reduce margins/padding
-st.markdown("""
-    <style>
-        .block-container {
-            padding-top: 2rem;
-            padding-bottom: 0rem;
-            padding-left: 2rem;
-            padding-right: 2rem;
-        }
-        .element-container {
-            margin-bottom: 1rem;
-        }
-    </style>
-""", unsafe_allow_html=True)
 
 def preprocess_image(image, config):
     """Enhanced image preprocessing with multiple options"""
@@ -80,16 +69,78 @@ def preprocess_image(image, config):
     
     return processed
 
-def main():
-    # File uploader
-    uploaded_file = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"])
+def process_file(file, preprocessing_config, ocr_config, output_format):
+    """Process a single image or page and return OCR results"""
+    try:
+        # Convert to numpy array
+        image = Image.open(file) if isinstance(file, (str, bytes, io.BytesIO)) else file
+        img_array = np.array(image)
+        
+        # Preprocess image
+        processed_img = preprocess_image(img_array, preprocessing_config)
+        
+        # Perform OCR with config
+        if output_format == "Plain Text":
+            result = pytesseract.image_to_string(
+                processed_img,
+                lang=ocr_config['lang'],
+                config=ocr_config['config']
+            )
+            return result, processed_img
+        elif output_format == "JSON with Confidence":
+            data = pytesseract.image_to_data(
+                processed_img,
+                lang=ocr_config['lang'],
+                config=ocr_config['config'],
+                output_type=pytesseract.Output.DICT
+            )
+            result = {
+                'text': " ".join([word for word in data['text'] if word.strip()]),
+                'confidence': data['conf']
+            }
+            return json.dumps(result, indent=2), processed_img
+        elif output_format == "JSON with Boxes":
+            boxes = pytesseract.image_to_boxes(
+                processed_img,
+                lang=ocr_config['lang'],
+                config=ocr_config['config']
+            )
+            return boxes, processed_img
+        else:  # JSON with Words
+            data = pytesseract.image_to_data(
+                processed_img,
+                lang=ocr_config['lang'],
+                config=ocr_config['config'],
+                output_type=pytesseract.Output.DICT
+            )
+            words = []
+            for i in range(len(data['text'])):
+                if data['text'][i].strip():
+                    words.append({
+                        'text': data['text'][i],
+                        'confidence': data['conf'][i],
+                        'box': {
+                            'x': data['left'][i],
+                            'y': data['top'][i],
+                            'width': data['width'][i],
+                            'height': data['height'][i]
+                        }
+                    })
+            return json.dumps({'words': words}, indent=2), processed_img
+    except Exception as e:
+        st.error(f"Error processing image: {str(e)}")
+        return None, None
+
+def main():    
     
+    # File uploader
+    uploaded_file = st.file_uploader("Upload a file", type=["png", "jpg", "jpeg", "pdf"])
     
     # Create two columns for layout
     left_col, right_col = st.columns([1, 1])
     
     with left_col:
-        st.markdown("**Input Image**")
+        st.markdown("**Document Pages**")
     
     with right_col:
         st.markdown("**Extracted Text**")
@@ -209,17 +260,134 @@ def main():
         ["Plain Text", "JSON with Confidence", "JSON with Boxes", "JSON with Words"]
     )
     
-
-    if uploaded_file is not None:
-        # Read image
-        image = Image.open(uploaded_file)
-        img_array = np.array(image)
+    # PDF specific options
+    pdf_options = {}
+    if uploaded_file is not None and uploaded_file.name.lower().endswith('.pdf'):
+        st.sidebar.title("PDF Options")
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            pdf_path = tmp_file.name
         
-        # Show original image
-        with left_col:
-            st.image(image, caption="Original Image", use_column_width=True)
+        # Get number of pages
+        pdf_pages = pdf2image.pdfinfo_from_path(pdf_path)
+        n_pages = pdf_pages["Pages"]
         
-        # Preprocess image with all options
+        # DPI for PDF conversion
+        pdf_options['dpi'] = st.sidebar.slider("PDF to Image DPI", 100, 600, 200, 50)
+        
+        # Process all pages
+        if uploaded_file is not None:
+            # Prepare OCR configuration
+            ocr_config = {
+                'lang': lang_options[selected_lang],
+                'config': f'--psm {psm_mode} --oem {oem_mode}'
+            }
+            if whitelist_chars:
+                ocr_config['config'] += f' -c tessedit_char_whitelist={whitelist_chars}'
+            if blacklist_chars:
+                ocr_config['config'] += f' -c tessedit_char_blacklist={blacklist_chars}'
+            ocr_config['config'] += f' --dpi {dpi}'
+            
+            # Prepare preprocessing configuration
+            preprocessing_config = {
+                'threshold': threshold_config,
+                'resize': resize_config,
+                'denoise': denoise,
+                'morphology': morph_config,
+                'rotate': rotate_config
+            }
+            
+            # Convert PDF pages to images and process them
+            with st.spinner(f"Processing all {n_pages} pages..."):
+                images = pdf2image.convert_from_path(
+                    pdf_path,
+                    dpi=pdf_options['dpi']
+                )
+                
+                all_results = []
+                all_processed_images = []
+                
+                progress_bar = st.progress(0)
+                for idx, image in enumerate(images, start=1):
+                    result, processed_img = process_file(
+                        image,
+                        preprocessing_config,
+                        ocr_config,
+                        output_format
+                    )
+                    if result:
+                        all_results.append((idx, result, processed_img))
+                    progress_bar.progress(idx / len(images))
+                progress_bar.empty()
+            
+            # Display results
+            if all_results:
+                # Create tabs for page images in left column
+                with left_col:
+                    tabs = st.tabs([f"Page {idx}" for idx, _, _ in all_results])
+                    for tab, (idx, _, processed_img) in zip(tabs, all_results):
+                        with tab:
+                            st.image(processed_img, use_column_width=True)
+                
+                # Show all text in right column
+                with right_col:
+                    # Join all text without page dividers
+                    if output_format == "Plain Text":
+                        combined_text = "\n\n".join(result for _, result, _ in all_results)
+                    else:
+                        # For JSON formats, combine results into a single JSON structure
+                        if output_format == "JSON with Confidence":
+                            combined_results = {
+                                "pages": [
+                                    {
+                                        "page": idx,
+                                        "content": json.loads(result)
+                                    } for idx, result, _ in all_results
+                                ]
+                            }
+                            combined_text = json.dumps(combined_results, indent=2)
+                        elif output_format == "JSON with Words":
+                            combined_results = {
+                                "pages": [
+                                    {
+                                        "page": idx,
+                                        "content": json.loads(result)
+                                    } for idx, result, _ in all_results
+                                ]
+                            }
+                            combined_text = json.dumps(combined_results, indent=2)
+                        else:  # JSON with Boxes
+                            combined_text = "\n\n".join(f"Page {idx}:\n{result}" for idx, result, _ in all_results)
+                    
+                    st.text_area("Extracted Text", combined_text, height=800)
+                
+                # Add download button
+                st.sidebar.markdown("---")
+                file_extension = '.json' if output_format != "Plain Text" else '.txt'
+                st.sidebar.download_button(
+                    label="Download All Pages",
+                    data=combined_text,
+                    file_name=f"extracted_text{file_extension}",
+                    mime="application/json" if output_format != "Plain Text" else "text/plain"
+                )
+            
+            # Cleanup temporary file
+            os.unlink(pdf_path)
+    
+    # Process image files
+    elif uploaded_file is not None:
+        # Prepare OCR configuration
+        ocr_config = {
+            'lang': lang_options[selected_lang],
+            'config': f'--psm {psm_mode} --oem {oem_mode}'
+        }
+        if whitelist_chars:
+            ocr_config['config'] += f' -c tessedit_char_whitelist={whitelist_chars}'
+        if blacklist_chars:
+            ocr_config['config'] += f' -c tessedit_char_blacklist={blacklist_chars}'
+        ocr_config['config'] += f' --dpi {dpi}'
+        
+        # Prepare preprocessing configuration
         preprocessing_config = {
             'threshold': threshold_config,
             'resize': resize_config,
@@ -228,86 +396,31 @@ def main():
             'rotate': rotate_config
         }
         
-        processed_img = preprocess_image(img_array, preprocessing_config)
-        with left_col:
-            st.image(processed_img, caption="Preprocessed Image", use_column_width=True)
+        # Process single image
+        result, processed_img = process_file(
+            uploaded_file,
+            preprocessing_config,
+            ocr_config,
+            output_format
+        )
         
-        # Perform OCR
-        try:
-            # Build tesseract config
-            custom_config = f'--psm {psm_mode} --oem {oem_mode}'
-            if whitelist_chars:
-                custom_config += f' -c tessedit_char_whitelist={whitelist_chars}'
-            if blacklist_chars:
-                custom_config += f' -c tessedit_char_blacklist={blacklist_chars}'
-            custom_config += f' --dpi {dpi}'
+        if result and processed_img is not None:
+            # Show processed image in left column
+            with left_col:
+                st.image(processed_img, caption="Processed Image", use_column_width=True)
             
-            # Get OCR result based on output format
-            if output_format == "Plain Text":
-                result = pytesseract.image_to_string(
-                    processed_img,
-                    lang=lang_options[selected_lang],
-                    config=custom_config
-                )
-                display_text = result
-            elif output_format == "JSON with Confidence":
-                data = pytesseract.image_to_data(
-                    processed_img,
-                    lang=lang_options[selected_lang],
-                    config=custom_config,
-                    output_type=pytesseract.Output.DICT
-                )
-                result = {
-                    'text': " ".join([word for word in data['text'] if word.strip()]),
-                    'confidence': data['conf']
-                }
-                display_text = json.dumps(result, indent=2)
-            elif output_format == "JSON with Boxes":
-                boxes = pytesseract.image_to_boxes(
-                    processed_img,
-                    lang=lang_options[selected_lang],
-                    config=custom_config
-                )
-                display_text = boxes
-            else:  # JSON with Words
-                data = pytesseract.image_to_data(
-                    processed_img,
-                    lang=lang_options[selected_lang],
-                    config=custom_config,
-                    output_type=pytesseract.Output.DICT
-                )
-                words = []
-                for i in range(len(data['text'])):
-                    if data['text'][i].strip():
-                        words.append({
-                            'text': data['text'][i],
-                            'confidence': data['conf'][i],
-                            'box': {
-                                'x': data['left'][i],
-                                'y': data['top'][i],
-                                'width': data['width'][i],
-                                'height': data['height'][i]
-                            }
-                        })
-                display_text = json.dumps({'words': words}, indent=2)
-            
-            # Display result
+            # Show text in right column
             with right_col:
-                st.text_area("Extracted Text", display_text, height=400)
+                st.text_area("Extracted Text", result, height=400)
                 
                 # Add download button for text
-                if display_text:
-                    file_extension = '.json' if output_format != "Plain Text" else '.txt'
-                    st.download_button(
-                        label="Download result",
-                        data=display_text,
-                        file_name=f"extracted_text{file_extension}",
-                        mime="application/json" if output_format != "Plain Text" else "text/plain"
-                    )
-        
-        except Exception as e:
-            st.error(f"Error during OCR: {str(e)}")
-            st.info("Make sure you have Tesseract installed and the language packs are available.")
+                file_extension = '.json' if output_format != "Plain Text" else '.txt'
+                st.download_button(
+                    label="Download result",
+                    data=result,
+                    file_name=f"extracted_text{file_extension}",
+                    mime="application/json" if output_format != "Plain Text" else "text/plain"
+                )
 
 if __name__ == "__main__":
     main()
