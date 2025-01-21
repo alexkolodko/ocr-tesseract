@@ -8,10 +8,33 @@ import json
 import pdf2image
 import tempfile
 import os
+import sys
 
 # Set page config
 st.set_page_config(layout="wide")
 
+# Check Tesseract installation
+try:
+    tesseract_version = pytesseract.get_tesseract_version()
+    st.sidebar.success(f"✓ Tesseract version: {tesseract_version}")
+except Exception as e:
+    st.sidebar.error(f"❌ Tesseract not found: {str(e)}")
+    st.sidebar.info("Please install Tesseract and make sure it's in your PATH")
+
+# Check poppler installation for PDF support
+try:
+    if sys.platform.startswith('win'):
+        if not os.environ.get('POPPLER_PATH'):
+            st.sidebar.warning("⚠️ POPPLER_PATH not set. PDF support may not work.")
+    else:
+        # On Unix systems, try to find poppler-utils
+        from shutil import which
+        if which('pdftoppm') is None:
+            st.sidebar.warning("⚠️ poppler-utils not found. PDF support may not work.")
+        else:
+            st.sidebar.success("✓ poppler-utils found")
+except Exception as e:
+    st.sidebar.warning(f"⚠️ Could not verify poppler installation: {str(e)}")
 
 def preprocess_image(image, config):
     """Enhanced image preprocessing with multiple options"""
@@ -131,7 +154,7 @@ def process_file(file, preprocessing_config, ocr_config, output_format):
         st.error(f"Error processing image: {str(e)}")
         return None, None
 
-def main():    
+def main():
     
     # File uploader
     uploaded_file = st.file_uploader("Upload a file", type=["png", "jpg", "jpeg", "pdf"])
@@ -154,6 +177,7 @@ def main():
         "Ukrainian": "ukr",
         "English + Ukrainian": "eng+ukr",
         "Russian": "rus",
+        "Russian + English": "rus+eng",
         "Russian + Ukrainian": "rus+ukr",
         "English + Russian + Ukrainian": "eng+rus+ukr"
     }
@@ -264,115 +288,145 @@ def main():
     pdf_options = {}
     if uploaded_file is not None and uploaded_file.name.lower().endswith('.pdf'):
         st.sidebar.title("PDF Options")
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            pdf_path = tmp_file.name
         
-        # Get number of pages
-        pdf_pages = pdf2image.pdfinfo_from_path(pdf_path)
-        n_pages = pdf_pages["Pages"]
-        
-        # DPI for PDF conversion
-        pdf_options['dpi'] = st.sidebar.slider("PDF to Image DPI", 100, 600, 200, 50)
-        
-        # Process all pages
-        if uploaded_file is not None:
-            # Prepare OCR configuration
-            ocr_config = {
-                'lang': lang_options[selected_lang],
-                'config': f'--psm {psm_mode} --oem {oem_mode}'
-            }
-            if whitelist_chars:
-                ocr_config['config'] += f' -c tessedit_char_whitelist={whitelist_chars}'
-            if blacklist_chars:
-                ocr_config['config'] += f' -c tessedit_char_blacklist={blacklist_chars}'
-            ocr_config['config'] += f' --dpi {dpi}'
+        try:
+            # Save PDF to temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                pdf_path = tmp_file.name
             
-            # Prepare preprocessing configuration
-            preprocessing_config = {
-                'threshold': threshold_config,
-                'resize': resize_config,
-                'denoise': denoise,
-                'morphology': morph_config,
-                'rotate': rotate_config
-            }
+            # Get number of pages
+            try:
+                pdf_pages = pdf2image.pdfinfo_from_path(pdf_path)
+                n_pages = pdf_pages["Pages"]
+                st.sidebar.info(f"PDF pages detected: {n_pages}")
+            except Exception as e:
+                st.error(f"Error reading PDF info: {str(e)}")
+                st.info("Please make sure poppler is properly installed")
+                return
             
-            # Convert PDF pages to images and process them
-            with st.spinner(f"Processing all {n_pages} pages..."):
-                images = pdf2image.convert_from_path(
-                    pdf_path,
-                    dpi=pdf_options['dpi']
-                )
-                
-                all_results = []
-                all_processed_images = []
-                
-                progress_bar = st.progress(0)
-                for idx, image in enumerate(images, start=1):
-                    result, processed_img = process_file(
-                        image,
-                        preprocessing_config,
-                        ocr_config,
-                        output_format
-                    )
-                    if result:
-                        all_results.append((idx, result, processed_img))
-                    progress_bar.progress(idx / len(images))
-                progress_bar.empty()
+            # DPI for PDF conversion
+            pdf_options['dpi'] = st.sidebar.slider("PDF to Image DPI", 100, 600, 200, 50)
             
-            # Display results
-            if all_results:
-                # Create tabs for page images in left column
-                with left_col:
-                    tabs = st.tabs([f"Page {idx}" for idx, _, _ in all_results])
-                    for tab, (idx, _, processed_img) in zip(tabs, all_results):
-                        with tab:
-                            st.image(processed_img, use_column_width=True)
+            # Process all pages
+            if uploaded_file is not None:
+                # Prepare OCR configuration
+                ocr_config = {
+                    'lang': lang_options[selected_lang],
+                    'config': f'--psm {psm_mode} --oem {oem_mode}'
+                }
+                if whitelist_chars:
+                    ocr_config['config'] += f' -c tessedit_char_whitelist={whitelist_chars}'
+                if blacklist_chars:
+                    ocr_config['config'] += f' -c tessedit_char_blacklist={blacklist_chars}'
+                ocr_config['config'] += f' --dpi {dpi}'
                 
-                # Show all text in right column
-                with right_col:
-                    # Join all text without page dividers
-                    if output_format == "Plain Text":
-                        combined_text = "\n\n".join(result for _, result, _ in all_results)
-                    else:
-                        # For JSON formats, combine results into a single JSON structure
-                        if output_format == "JSON with Confidence":
-                            combined_results = {
-                                "pages": [
-                                    {
-                                        "page": idx,
-                                        "content": json.loads(result)
-                                    } for idx, result, _ in all_results
-                                ]
-                            }
-                            combined_text = json.dumps(combined_results, indent=2)
-                        elif output_format == "JSON with Words":
-                            combined_results = {
-                                "pages": [
-                                    {
-                                        "page": idx,
-                                        "content": json.loads(result)
-                                    } for idx, result, _ in all_results
-                                ]
-                            }
-                            combined_text = json.dumps(combined_results, indent=2)
-                        else:  # JSON with Boxes
-                            combined_text = "\n\n".join(f"Page {idx}:\n{result}" for idx, result, _ in all_results)
+                # Prepare preprocessing configuration
+                preprocessing_config = {
+                    'threshold': threshold_config,
+                    'resize': resize_config,
+                    'denoise': denoise,
+                    'morphology': morph_config,
+                    'rotate': rotate_config
+                }
+                
+                # Convert PDF pages to images and process them
+                try:
+                    with st.spinner(f"Processing all {n_pages} pages..."):
+                        st.info("Converting PDF to images...")
+                        images = pdf2image.convert_from_path(
+                            pdf_path,
+                            dpi=pdf_options['dpi']
+                        )
+                        st.success(f"Successfully converted {len(images)} pages")
+                        
+                        all_results = []
+                        all_processed_images = []
+                        
+                        progress_bar = st.progress(0)
+                        for idx, image in enumerate(images, start=1):
+                            st.info(f"Processing page {idx}/{len(images)}")
+                            result, processed_img = process_file(
+                                image,
+                                preprocessing_config,
+                                ocr_config,
+                                output_format
+                            )
+                            if result:
+                                all_results.append((idx, result, processed_img))
+                                st.success(f"✓ Page {idx} processed")
+                            else:
+                                st.error(f"❌ Failed to process page {idx}")
+                            progress_bar.progress(idx / len(images))
+                        progress_bar.empty()
+                
+                except Exception as e:
+                    st.error(f"Error processing PDF: {str(e)}")
+                    st.info("Try adjusting the DPI value or check if poppler is properly installed")
+                    return
+                
+                # Display results
+                if all_results:
+                    # Create tabs for page images in left column
+                    with left_col:
+                        tabs = st.tabs([f"Page {idx}" for idx, _, _ in all_results])
+                        for tab, (idx, _, processed_img) in zip(tabs, all_results):
+                            with tab:
+                                st.image(processed_img, use_column_width=True)
                     
-                    st.text_area("Extracted Text", combined_text, height=800)
-                
-                # Add download button
-                st.sidebar.markdown("---")
-                file_extension = '.json' if output_format != "Plain Text" else '.txt'
-                st.sidebar.download_button(
-                    label="Download All Pages",
-                    data=combined_text,
-                    file_name=f"extracted_text{file_extension}",
-                    mime="application/json" if output_format != "Plain Text" else "text/plain"
-                )
+                    # Show all text in right column
+                    with right_col:
+                        # Join all text without page dividers
+                        if output_format == "Plain Text":
+                            combined_text = "\n\n".join(result for _, result, _ in all_results)
+                        else:
+                            # For JSON formats, combine results into a single JSON structure
+                            if output_format == "JSON with Confidence":
+                                combined_results = {
+                                    "pages": [
+                                        {
+                                            "page": idx,
+                                            "content": json.loads(result)
+                                        } for idx, result, _ in all_results
+                                    ]
+                                }
+                                combined_text = json.dumps(combined_results, indent=2)
+                            elif output_format == "JSON with Words":
+                                combined_results = {
+                                    "pages": [
+                                        {
+                                            "page": idx,
+                                            "content": json.loads(result)
+                                        } for idx, result, _ in all_results
+                                    ]
+                                }
+                                combined_text = json.dumps(combined_results, indent=2)
+                            else:  # JSON with Boxes
+                                combined_text = "\n\n".join(f"Page {idx}:\n{result}" for idx, result, _ in all_results)
+                        
+                        st.text_area("Extracted Text", combined_text, height=800)
+                    
+                    # Add download button
+                    st.sidebar.markdown("---")
+                    file_extension = '.json' if output_format != "Plain Text" else '.txt'
+                    st.sidebar.download_button(
+                        label="Download All Pages",
+                        data=combined_text,
+                        file_name=f"extracted_text{file_extension}",
+                        mime="application/json" if output_format != "Plain Text" else "text/plain"
+                    )
+                else:
+                    st.warning("No results were generated. Please check the error messages above.")
             
             # Cleanup temporary file
-            os.unlink(pdf_path)
+            try:
+                os.unlink(pdf_path)
+            except Exception as e:
+                st.warning(f"Could not remove temporary file: {str(e)}")
+        
+        except Exception as e:
+            st.error(f"Error handling PDF file: {str(e)}")
+            st.info("Please make sure the PDF file is valid and not corrupted")
     
     # Process image files
     elif uploaded_file is not None:
